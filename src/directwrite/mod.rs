@@ -23,6 +23,9 @@ use super::{
 /// https://docs.microsoft.com/en-us/typography/opentype/spec/recom#glyph-0-the-notdef-glyph
 const MISSING_GLYPH_INDEX: u16 = 0;
 
+/// User-preferred font fallback list, checked before DirectWrite's system fallback.
+const HARDCODED_FALLBACK_FONTS: &[&str] = &["LXGW WenKai Mono Screen"];
+
 /// Cached DirectWrite font.
 struct Font {
     face: FontFace,
@@ -36,6 +39,7 @@ pub struct DirectWriteRasterizer {
     fonts: HashMap<FontKey, Font>,
     keys: HashMap<FontDesc, FontKey>,
     available_fonts: FontCollection,
+    hardcoded_fallbacks: HashMap<(u32, u32, u32), Vec<Font>>,
     fallback_sequence: Option<FontFallback>,
 }
 
@@ -98,8 +102,54 @@ impl DirectWriteRasterizer {
         self.fonts.get(&font_key).ok_or(Error::UnknownFontKey)
     }
 
-    fn get_glyph_index(&self, face: &FontFace, character: char) -> u16 {
+    fn get_glyph_index(face: &FontFace, character: char) -> u16 {
         face.get_glyph_indices(&[character as u32]).first().copied().unwrap_or(MISSING_GLYPH_INDEX)
+    }
+
+    fn fallback_cache_key(
+        weight: FontWeight,
+        style: FontStyle,
+        stretch: FontStretch,
+    ) -> (u32, u32, u32) {
+        (weight.to_u32(), style.to_u32(), stretch.to_u32())
+    }
+
+    fn cache_hardcoded_fallbacks(
+        &mut self,
+        weight: FontWeight,
+        style: FontStyle,
+        stretch: FontStretch,
+    ) {
+        let key = Self::fallback_cache_key(weight, style, stretch);
+        if self.hardcoded_fallbacks.contains_key(&key) {
+            return;
+        }
+
+        let fonts = HARDCODED_FALLBACK_FONTS
+            .iter()
+            .filter_map(|family_name| {
+                self.available_fonts
+                    .get_font_family_by_name(family_name)
+                    .map(|family| family.get_first_matching_font(weight, stretch, style).into())
+            })
+            .collect();
+
+        self.hardcoded_fallbacks.insert(key, fonts);
+    }
+
+    fn get_hardcoded_fallback_font(
+        &self,
+        weight: FontWeight,
+        style: FontStyle,
+        stretch: FontStretch,
+        character: char,
+    ) -> Option<&Font> {
+        let key = Self::fallback_cache_key(weight, style, stretch);
+
+        self.hardcoded_fallbacks
+            .get(&key)?
+            .iter()
+            .find(|font| Self::get_glyph_index(&font.face, character) != MISSING_GLYPH_INDEX)
     }
 
     fn get_fallback_font(&self, loaded_font: &Font, character: char) -> Option<dwrote::Font> {
@@ -140,6 +190,7 @@ impl crate::Rasterize for DirectWriteRasterizer {
             fonts: HashMap::new(),
             keys: HashMap::new(),
             available_fonts: FontCollection::system(),
+            hardcoded_fallbacks: HashMap::new(),
             fallback_sequence: FontFallback::get_system_fallback(),
         })
     }
@@ -164,7 +215,7 @@ impl crate::Rasterize for DirectWriteRasterizer {
 
         // Since all monospace characters have the same width, we use `!` for horizontal metrics.
         let character = '!';
-        let glyph_index = self.get_glyph_index(face, character);
+        let glyph_index = Self::get_glyph_index(face, character);
 
         let glyph_metrics = face.get_design_glyph_metrics(&[glyph_index], false);
         let hmetrics = glyph_metrics.first().ok_or(Error::MetricsNotFound)?;
@@ -227,21 +278,55 @@ impl crate::Rasterize for DirectWriteRasterizer {
     }
 
     fn get_glyph(&mut self, glyph: GlyphKey) -> Result<RasterizedGlyph, Error> {
-        let loaded_font = self.get_loaded_font(glyph.font_key)?;
+        let (weight, style, stretch, mut glyph_index) = {
+            let loaded_font = self.get_loaded_font(glyph.font_key)?;
+            (
+                loaded_font.weight,
+                loaded_font.style,
+                loaded_font.stretch,
+                Self::get_glyph_index(&loaded_font.face, glyph.character),
+            )
+        };
 
-        let loaded_fallback_font;
-        let mut font = loaded_font;
-        let mut glyph_index = self.get_glyph_index(&loaded_font.face, glyph.character);
-        if glyph_index == MISSING_GLYPH_INDEX {
-            if let Some(fallback_font) = self.get_fallback_font(loaded_font, glyph.character) {
-                loaded_fallback_font = Font::from(fallback_font);
-                glyph_index = self.get_glyph_index(&loaded_fallback_font.face, glyph.character);
-                font = &loaded_fallback_font;
+        let rasterized_glyph = if glyph_index == MISSING_GLYPH_INDEX {
+            self.cache_hardcoded_fallbacks(weight, style, stretch);
+
+            if let Some(hardcoded_fallback) =
+                self.get_hardcoded_fallback_font(weight, style, stretch, glyph.character)
+            {
+                glyph_index = Self::get_glyph_index(&hardcoded_fallback.face, glyph.character);
+                self.rasterize_glyph(
+                    &hardcoded_fallback.face,
+                    glyph.size,
+                    glyph.character,
+                    glyph_index,
+                )?
+            } else {
+                let loaded_font = self.get_loaded_font(glyph.font_key)?;
+
+                if let Some(fallback_font) = self.get_fallback_font(loaded_font, glyph.character) {
+                    let loaded_fallback_font = Font::from(fallback_font);
+                    glyph_index =
+                        Self::get_glyph_index(&loaded_fallback_font.face, glyph.character);
+                    self.rasterize_glyph(
+                        &loaded_fallback_font.face,
+                        glyph.size,
+                        glyph.character,
+                        glyph_index,
+                    )?
+                } else {
+                    self.rasterize_glyph(
+                        &loaded_font.face,
+                        glyph.size,
+                        glyph.character,
+                        glyph_index,
+                    )?
+                }
             }
-        }
-
-        let rasterized_glyph =
-            self.rasterize_glyph(&font.face, glyph.size, glyph.character, glyph_index)?;
+        } else {
+            let loaded_font = self.get_loaded_font(glyph.font_key)?;
+            self.rasterize_glyph(&loaded_font.face, glyph.size, glyph.character, glyph_index)?
+        };
 
         if glyph_index == MISSING_GLYPH_INDEX {
             Err(Error::MissingGlyph(rasterized_glyph))
